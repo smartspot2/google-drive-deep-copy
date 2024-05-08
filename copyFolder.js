@@ -7,7 +7,7 @@
  *
  * Copy the <ID> portion of the URL here.
  */
-const SOURCE_FOLDER_ID = "12WSpralBgW44ys0oiV6_VbvJY9xakL_Z";
+const SOURCE_FOLDER_ID = "1UO5MWPn4ylPaZHdZLTgxqw55kFUmaFMT";
 
 /**
  * Destination folder name.
@@ -42,8 +42,6 @@ let jobTimeoutTime;
 
 /**
  * Main function; initial checks and starts the copy process.
- *
- * TODO: forms seem to be duplicated INSIDE the source folder?
  */
 function main() {
   jobTimeoutTime = Date.now() + MAX_RUNTIME_MS;
@@ -52,26 +50,31 @@ function main() {
   const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
 
   // check the temporary state file
-  const copiedFileIds = _readState();
+  let fileTree = _readState();
 
   const destFolderIterator = rootFolder.getFoldersByName(DEST_FOLDER_NAME);
 
   let destFolder;
-  if (copiedFileIds.size == 0) {
+  if (fileTree == null) {
     // if not a retry, check that the destination folder doesn't exist already
     if (destFolderIterator.hasNext()) {
       // exists already, fail with error
-      throw Error(
+      throw new Error(
         `Destination folder ${DEST_FOLDER_NAME} already exists at the root of the Google Drive!`,
       );
     }
 
     // create the destination folder
     destFolder = rootFolder.createFolder(DEST_FOLDER_NAME);
+
+    // generate the file tree
+    Logger.log("Exploring file tree to generate structure");
+    fileTree = exploreFileTree(sourceFolder);
+    fileTree.destId = destFolder.getId();
   } else {
     // folder should exist already
     if (!destFolderIterator.hasNext()) {
-      throw Error(
+      throw new Error(
         `Destination folder ${DEST_FOLDER_NAME} does not exist, but the temporary state file exists!`,
       );
     }
@@ -80,18 +83,20 @@ function main() {
     destFolder = destFolderIterator.next();
   }
 
-  // create the destination folder
-  sourceFolder.getFiles();
+  // create folders
+  let copySuccessful = createFolders(fileTree);
 
-  // recursively copy files
-  const copySuccessful = copyFiles(copiedFileIds, sourceFolder, destFolder);
+  if (copySuccessful) {
+    // copy files
+    copySuccessful = copyFiles(fileTree);
+  }
 
   if (!copySuccessful) {
     Logger.log(
       `TIMED OUT! Retrying in ${RETRY_DELAY_MS}ms through a new trigger...`,
     );
     // if unsuccessful, it's because of a timeout; save state to a file
-    _saveState(copiedFileIds);
+    _saveState(fileTree);
 
     // set a new trigger to run the next retry
     ScriptApp.newTrigger("main").timeBased().after(RETRY_DELAY_MS).create();
@@ -110,100 +115,203 @@ function main() {
 }
 
 /**
+ * FolderState type used in future functions.
+ *
+ * Contains information about a Google Drive folder,
+ * used to keep track of state when copying folders and files.
+ *
+ * `foldersCopied`: whether all child folders have been successfully copied (including recursive children)
+ * `filesCopied`: whether all child files have been successfully copied (including recursive children)
+ *
+ * @typedef {{
+ *    id: string,
+ *    name: string,
+ *    filesCopied: boolean,
+ *    foldersCopied: boolean,
+ *    files: FileState[],
+ *    folders: FolderState[],
+ *    destId: null | string,
+ * }} FolderState
+ */
+
+/**
+ * FileSstate type used in future functions.
+ *
+ * Contains information about a Google Drive file,
+ * used to keep track of state when copying.
+ *
+ * `copied`: whether this file has been successfully copied
+ *
+ * @typedef {{
+ *    id: string,
+ *    name: string,
+ *    destId: null | string,
+ * }} FileState
+ */
+
+/**
+ * Explore the folder structure of a given folder.
+ *
+ * @param {GoogleAppsScript.Drive.Folder} folder - Folder to explore
+ *
+ * @returns {FolderState}
+ */
+function exploreFileTree(folder) {
+  const childrenFiles = [];
+  const childrenFileIterator = folder.getFiles();
+  while (childrenFileIterator.hasNext()) {
+    const childFile = childrenFileIterator.next();
+    childrenFiles.push({
+      id: childFile.getId(),
+      name: childFile.getName(),
+      destId: null,
+    });
+  }
+
+  const childrenFolders = [];
+  const childrenFolderIterator = folder.getFolders();
+  while (childrenFolderIterator.hasNext()) {
+    const childFolder = childrenFolderIterator.next();
+    childrenFolders.push(exploreFileTree(childFolder));
+  }
+
+  return {
+    id: folder.getId(),
+    name: folder.getName(),
+    // flag for whether all children files (recursively) have been copied
+    filesCopied: false,
+    // flag for whether all children folders (recusrively) have been copied
+    foldersCopied: false,
+    // destination folder; null if not copied,
+    // non-null if this folder (not necessarily its contents) has been copied already
+    destId: null,
+    // files are stored as FileState objects
+    files: childrenFiles,
+    // recursive structure for folders
+    folders: childrenFolders,
+  };
+}
+
+/**
+ * Copy all folders in a file tree in preparation for file copying.
+ *
+ * Assumes that the root folder has already been copied over.
+ * The `destFolder` corresponds to this copied root folder.
+ *
+ * @param {FolderState} fileTree - File tree to copy
+ * @param {GoogleAppsScript.Drive.Folder} destFolder - Destination folder; corresopnds to the `fileTree` root folder.
+ *
+ * @returns {boolean} - Whether the folders have all been successully copied. If false, a timeout occurred.
+ */
+function createFolders(fileTree, history = "") {
+  const newHistory = `${history}/${fileTree.name}`;
+  if (fileTree.foldersCopied) {
+    // if already done, skip
+    return true;
+  }
+
+  if (_checkTimeout()) {
+    return false;
+  }
+
+  const destFolderId = fileTree.destId;
+  const destFolder = DriveApp.getFolderById(destFolderId);
+
+  let creationSuccessful = true;
+
+  for (const folderState of fileTree.folders) {
+    if (folderState.destId != null) {
+      // skip if folder already copied
+      continue;
+    }
+
+    // create folder with the same name
+    Logger.log(`Creating folder ${newHistory}/${folderState.name}`);
+    const folderName = folderState.name;
+    const newFolder = destFolder.createFolder(folderName);
+    folderState.destId = newFolder.getId();
+
+    // recurse on the child folder
+    creationSuccessful = createFolders(folderState, newHistory);
+
+    if (!creationSuccessful) break;
+  }
+
+  if (creationSuccessful) {
+    // set flag if all child folder creation was successful
+    fileTree.foldersCopied = true;
+  }
+
+  return creationSuccessful;
+}
+
+/**
  * Recursively copy files from `sourceFolder` to `destFolder`.
  *
  * TODO: keep track of the exact folder structure and the file IDs;
  * right now, if there are multiple folders with the same name, they'll get merged together
  * (which honestly shouldn't be an issue, but it means this isn't really an exact clone of the source folder)
  *
- * @param {GoogleAppsScript.Drive.Folder} sourceFolder - Source folder to copy files from
- * @param {GoogleAppsScript.Drive.Folder} destFolder - Destination folder to copy files to
+ * @param {FolderState} fileTree - File tree to copy over
+ *
+ * @returns {boolean} - Whether or not files were copied successfully. If false, a timeout occurred.
  */
-function copyFiles(copiedFileIds, sourceFolder, destFolder, history = "") {
+function copyFiles(fileTree, history = "") {
+  const newHistory = `${history}/${fileTree.name}`;
+
+  if (fileTree.filesCopied) {
+    return true;
+  }
+
   if (_checkTimeout()) {
     return false;
   }
 
-  Logger.log(
-    `Copying files in ${history}/${sourceFolder.getName()} [${copiedFileIds.size} items so far]`,
-  );
+  const parentFolder = DriveApp.getFolderById(fileTree.destId);
 
-  const sourceFileIterator = sourceFolder.getFiles();
-  while (sourceFileIterator.hasNext()) {
-    const file = sourceFileIterator.next();
-    const fileId = file.getId();
-    const fileName = file.getName();
+  for (const fileObj of fileTree.files) {
+    if (fileObj.destId != null) {
+      // skip if already copied
+      continue;
+    }
 
     if (_checkTimeout()) {
       return false;
     }
 
-    if (copiedFileIds.has(fileId)) {
-      // already copied; skip
-      continue;
-    }
+    Logger.log(`Copying ${newHistory}/${fileObj.name}`);
 
-    // check mimetype
+    const file = DriveApp.getFileById(fileObj.id);
+    const fileId = fileObj.id;
+    const fileName = fileObj.name;
     const fileMimeType = file.getMimeType();
 
+    // copy file
+    let copiedFile;
     if (fileMimeType == MimeType.GOOGLE_SHEETS) {
       // handle spreadsheets separately
-      handleCopySpreadsheet(fileId, destFolder);
+      copiedFile = handleCopySpreadsheet(fileId, parentFolder);
     } else {
       // make a copy of the file in the destination folder with the same name
-      file.makeCopy(fileName, destFolder);
+      copiedFile = file.makeCopy(fileName, parentFolder);
     }
 
-    // add file ID to the current state
-    copiedFileIds.add(fileId);
+    fileObj.destId = copiedFile.getId();
   }
 
-  // return value (accumulated throughout recursive calls)
-  let successful = true;
-
-  const sourceFolderIterator = sourceFolder.getFolders();
-  while (sourceFolderIterator.hasNext()) {
-    const innerSourceFolder = sourceFolderIterator.next();
-    const innerSourceFolderId = innerSourceFolder.getId();
-
-    if (_checkTimeout()) {
-      return false;
-    }
-
-    if (copiedFileIds.has(innerSourceFolderId)) {
-      // already copied; skip
-      continue;
-    }
-
-    const innerDestFolderIterator = destFolder.getFoldersByName(
-      innerSourceFolder.getName(),
-    );
-    let innerDestFolder;
-    if (innerDestFolderIterator.hasNext()) {
-      // use existing folder
-      innerDestFolder = innerDestFolderIterator.next();
-    } else {
-      // create a folder with the same name in the destination directory
-      innerDestFolder = destFolder.createFolder(innerSourceFolder.getName());
-    }
-
-    // recurse
-    successful = copyFiles(
-      copiedFileIds,
-      innerSourceFolder,
-      innerDestFolder,
-      `${history}/${sourceFolder.getName()}`,
-    );
-
-    if (!successful) {
-      break;
-    } else {
-      // successful, so add to copied files
-      copiedFileIds.add(innerSourceFolderId);
-    }
+  // recurse on all child folders
+  let copySuccessful = true;
+  for (const childFileTree of fileTree.folders) {
+    copySuccessful = copyFiles(childFileTree, newHistory);
+    if (!copySuccessful) break;
   }
 
-  return successful;
+  if (copySuccessful) {
+    // set flag if all child files were successfully copied
+    fileTree.filesCopied = true;
+  }
+
+  return copySuccessful;
 }
 
 /**
@@ -217,6 +325,8 @@ function copyFiles(copiedFileIds, sourceFolder, destFolder, history = "") {
  *
  * @param {number} fileId - ID of the spreadsheet file to copy; assumes that this is actually a spreadsheet
  * @param {DriveApp.Folder} destFolder - Destination folder to copy to
+ *
+ * @returns {DriveApp.File}
  */
 function handleCopySpreadsheet(fileId, destFolder) {
   const spreadsheetFile = DriveApp.getFileById(fileId);
@@ -253,13 +363,17 @@ function handleCopySpreadsheet(fileId, destFolder) {
       }
     }
   }
+
+  return destSpreadsheetFile;
 }
 
 /**
  * Save the current state of copied file IDs to a file.
+ *
+ * @param {FolderState} fileTree - file tree to store
  */
-function _saveState(copiedFileIds) {
-  const jsonIds = JSON.stringify(Array.from(copiedFileIds));
+function _saveState(fileTree) {
+  const jsonIds = JSON.stringify(fileTree);
   const rootFolder = DriveApp.getRootFolder();
   const stateFileIterator = rootFolder.getFilesByName(TEMP_STATE_FILENAME);
   if (stateFileIterator.hasNext()) {
@@ -274,18 +388,20 @@ function _saveState(copiedFileIds) {
 
 /**
  * Read the current state of copied file IDs.
+ *
+ * @returns {FolderState | null}
  */
 function _readState() {
-  let copiedFileIds = new Set();
   const rootFolder = DriveApp.getRootFolder();
   const stateFileIterator = rootFolder.getFilesByName(TEMP_STATE_FILENAME);
+  let fileTree = null;
   if (stateFileIterator.hasNext()) {
     // prior state exists; load it
     const stateFile = stateFileIterator.next();
     const stateFileContent = stateFile.getBlob().getDataAsString();
-    copiedFileIds = new Set(JSON.parse(stateFileContent));
+    fileTree = JSON.parse(stateFileContent);
   }
-  return copiedFileIds;
+  return fileTree;
 }
 
 /**
@@ -304,4 +420,3 @@ function _deleteState() {
 function _checkTimeout() {
   return Date.now() >= jobTimeoutTime;
 }
-
