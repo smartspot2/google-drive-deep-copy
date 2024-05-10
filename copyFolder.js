@@ -36,9 +36,68 @@ const MAX_RUNTIME_MS = 5 * 60 * 1000;
 const RETRY_DELAY_MS = 1000;
 
 /**
- * Global variable; start time of the job.
+ * Whether to convert all docs/slides/sheets to native Google Drive formats.
+ */
+const CONVERT_NATIVE_FORMAT = true;
+
+/**
+ * Maximum time allowed for exponential backoff.
+ *
+ * Exponential backoff is used when a Drive API request fails due to a rate limit.
+ */
+const MAX_BACKOFF_TIME_MS = 32 * 1000;
+
+/**
+ * Maximum number of attempts in case of retries during exponential backoff.
+ *
+ * Exponential backoff is used when a Drive API request fails due to a rate limit.
+ */
+const MAX_BACKOFF_ATTEMPTS = 20;
+
+/**
+ * Debug level for print statements.
+ *
+ * 0: DEBUG; Print all logs
+ * 1: INFO; Print only stage logs (and above)
+ * 2: WARN; Print only warnings (and above)
+ * 3: ERROR; Print only errors
+ */
+const DEBUG_LEVEL = 0;
+
+/******
+ * GLOBAL VARIABLES
+ ******/
+
+/**
+ * Start time of the job.
  */
 let jobTimeoutTime;
+
+/**
+ * Debug level mapping
+ */
+const DEBUG_LEVELS = {
+  DEBUG: 0,
+  INFO: 1,
+  WARN: 2,
+  ERROR: 3,
+};
+
+/**
+ * Conversion mapping.
+ *
+ * @type {Map<string, string>}
+ */
+const FORMAT_CONVERSION_MAPPING = new Map(
+  Object.entries({
+    [MimeType.MICROSOFT_EXCEL]: MimeType.GOOGLE_SHEETS,
+    [MimeType.MICROSOFT_EXCEL_LEGACY]: MimeType.GOOGLE_SHEETS,
+    [MimeType.MICROSOFT_POWERPOINT]: MimeType.GOOGLE_SLIDES,
+    [MimeType.MICROSOFT_POWERPOINT_LEGACY]: MimeType.GOOGLE_SLIDES,
+    [MimeType.MICROSOFT_WORD]: MimeType.GOOGLE_DOCS,
+    [MimeType.MICROSOFT_WORD_LEGACY]: MimeType.GOOGLE_DOCS,
+  }),
+);
 
 /**
  * Main function; initial checks and starts the copy process.
@@ -64,12 +123,14 @@ function main() {
       );
     }
 
+    // generate the file tree
+    logWhen(DEBUG_LEVELS.INFO, () =>
+      console.info("Exploring file tree to generate structure"),
+    );
+    fileTree = exploreFileTree(sourceFolder);
+
     // create the destination folder
     destFolder = rootFolder.createFolder(DEST_FOLDER_NAME);
-
-    // generate the file tree
-    Logger.log("Exploring file tree to generate structure");
-    fileTree = exploreFileTree(sourceFolder);
     fileTree.destId = destFolder.getId();
   } else {
     // folder should exist already
@@ -80,20 +141,45 @@ function main() {
     }
 
     // use existing destination folder
+    logWhen(DEBUG_LEVELS.INFO, () =>
+      console.info("Resuming from prior run; using last file tree"),
+    );
     destFolder = destFolderIterator.next();
   }
+
+  logWhen(DEBUG_LEVELS.INFO, () => printFileTreeSummary(fileTree));
+
+  logWhen(DEBUG_LEVELS.INFO, () => {
+    console.info("Copying folder structure");
+    console.time("Copying folders");
+  });
 
   // create folders
   let copySuccessful = createFolders(fileTree);
 
+  logWhen(DEBUG_LEVELS.INFO, () => {
+    console.timeEnd("Copying folders");
+  });
+
   if (copySuccessful) {
+    if (DEBUG_LEVEL <= DEBUG_LEVELS.INFO) {
+      console.info("Copying files");
+      console.time("Copying files");
+    }
+
     // copy files
     copySuccessful = copyFiles(fileTree);
+
+    if (DEBUG_LEVEL <= DEBUG_LEVELS.INFO) {
+      console.timeEnd("Copying files");
+    }
   }
 
   if (!copySuccessful) {
-    Logger.log(
-      `TIMED OUT! Retrying in ${RETRY_DELAY_MS}ms through a new trigger...`,
+    logWhen(DEBUG_LEVELS.WARN, () =>
+      console.warn(
+        `TIMED OUT! Retrying in ${RETRY_DELAY_MS}ms through a new trigger...`,
+      ),
     );
     // if unsuccessful, it's because of a timeout; save state to a file
     _saveState(fileTree);
@@ -111,6 +197,10 @@ function main() {
         ScriptApp.deleteTrigger(trigger);
       }
     }
+    logWhen(DEBUG_LEVELS.INFO, () => {
+      console.info("Done copying!");
+      printFileTreeSummary(fileTree);
+    });
   }
 }
 
@@ -135,7 +225,7 @@ function main() {
  */
 
 /**
- * FileSstate type used in future functions.
+ * FileState type used in future functions.
  *
  * Contains information about a Google Drive file,
  * used to keep track of state when copying.
@@ -226,7 +316,9 @@ function createFolders(fileTree, history = "") {
     }
 
     // create folder with the same name
-    Logger.log(`Creating folder ${newHistory}/${folderState.name}`);
+    logWhen(DEBUG_LEVELS.DEBUG, () =>
+      console.log(`Creating folder ${newHistory}/${folderState.name}`),
+    );
     const folderName = folderState.name;
     const newFolder = destFolder.createFolder(folderName);
     folderState.destId = newFolder.getId();
@@ -279,8 +371,6 @@ function copyFiles(fileTree, history = "") {
       return false;
     }
 
-    Logger.log(`Copying ${newHistory}/${fileObj.name}`);
-
     const file = DriveApp.getFileById(fileObj.id);
     const fileId = fileObj.id;
     const fileName = fileObj.name;
@@ -290,9 +380,25 @@ function copyFiles(fileTree, history = "") {
     let copiedFile;
     if (fileMimeType == MimeType.GOOGLE_SHEETS) {
       // handle spreadsheets separately
+      logWhen(DEBUG_LEVELS.DEBUG, () =>
+        console.log(
+          `Copying ${newHistory}/${fileObj.name} (Google Sheets handling)`,
+        ),
+      );
       copiedFile = handleCopySpreadsheet(fileId, parentFolder);
+    } else if (FORMAT_CONVERSION_MAPPING.has(fileMimeType)) {
+      // handle conversion between formats
+      logWhen(DEBUG_LEVELS.DEBUG, () =>
+        console.log(
+          `Copying ${newHistory}/${fileObj.name} (Format conversion handling)`,
+        ),
+      );
+      copiedFile = handleFormatConversion(fileId, parentFolder);
     } else {
       // make a copy of the file in the destination folder with the same name
+      logWhen(DEBUG_LEVELS.DEBUG, () =>
+        console.log(`Copying ${newHistory}/${fileObj.name}`),
+      );
       copiedFile = file.makeCopy(fileName, parentFolder);
     }
 
@@ -324,9 +430,9 @@ function copyFiles(fileTree, history = "") {
  * and then follows the linked form(s) in the duplicate spreadsheet to delete them.
  *
  * @param {number} fileId - ID of the spreadsheet file to copy; assumes that this is actually a spreadsheet
- * @param {DriveApp.Folder} destFolder - Destination folder to copy to
+ * @param {GoogleAppsScript.Drive.Folder} destFolder - Destination folder to copy to
  *
- * @returns {DriveApp.File}
+ * @returns {GoogleAppsScript.Drive.File}
  */
 function handleCopySpreadsheet(fileId, destFolder) {
   const spreadsheetFile = DriveApp.getFileById(fileId);
@@ -365,6 +471,125 @@ function handleCopySpreadsheet(fileId, destFolder) {
   }
 
   return destSpreadsheetFile;
+}
+
+/**
+ * Special handling for copying with format conversion.
+ *
+ * @param {string} fileId - ID of the file to copy
+ * @param {GoogleAppsScript.Drive.Folder} destFolder - Destination folder to copy to
+ *
+ * @returns {GoogleAppsScript.Drive.File}
+ */
+function handleFormatConversion(fileId, destFolder) {
+  const file = DriveApp.getFileById(fileId);
+  const fileBlob = file.getBlob();
+
+  const fileMimeType = file.getMimeType();
+
+  if (FORMAT_CONVERSION_MAPPING.has(fileMimeType)) {
+    // get converted MIME type
+    const convertedMimeType = FORMAT_CONVERSION_MAPPING.get(fileMimeType);
+    // create the new file in the destination folder
+    return withBackoff(() =>
+      Drive.Files.create(
+        {
+          name: file.getName(),
+          parents: [destFolder.getId()],
+          mimeType: convertedMimeType,
+        },
+        fileBlob,
+      ),
+    );
+  } else {
+    return defaultCopy(file, destFolder);
+  }
+}
+
+/**
+ * Default copy operation.
+ *
+ * @param {GoogleAppsScript.Drive.File} file - File to copy
+ * @param {GoogleAppsScript.Drive.Folder} destFolder - Destination folder to copy to
+ *
+ * @returns {GoogleAppsScript.Drive.File} Copied file
+ */
+function defaultCopy(file, destFolder) {
+  return file.makeCopy(file.getName(), destFolder);
+}
+
+/**
+ * Print a summary of the file tree.
+ *
+ * @param {FolderState} fileTree - File tree to print summary details for
+ */
+function printFileTreeSummary(fileTree) {
+  let numFilesCopied = 0;
+  let numFoldersCopied = 0;
+  let totalFileCount = 0;
+  let totalFolderCount = 0;
+
+  /**
+   *  Helper function for recursively traversing the file tree.
+   *
+   *  @param {FolderState} tree
+   */
+  const _traverse = (tree) => {
+    // stats for child files
+    for (const file of tree.files) {
+      numFilesCopied += file.destId != null;
+      totalFileCount++;
+    }
+
+    // stats for this folder
+    numFoldersCopied += tree.destId != null;
+    totalFolderCount++;
+
+    // stats for child folders
+    for (const folder of tree.folders) {
+      _traverse(folder);
+    }
+  };
+
+  // collect data
+  _traverse(fileTree);
+
+  // print data
+  logWhen(DEBUG_LEVELS.INFO, () => {
+    console.info(
+      `Total copied: ${numFilesCopied + numFoldersCopied} / ${totalFileCount + totalFolderCount}\n` +
+        `Copied files: ${numFilesCopied} / ${totalFileCount}\n` +
+        `Copied folders: ${numFoldersCopied} / ${totalFolderCount}`,
+    );
+  });
+}
+
+/**
+ * Exponential backoff, as described in the Google API docs.
+ *
+ * Calls the callback function repeatedly until no errors occur.
+ *
+ * @param {() => void} callback
+ */
+function withBackoff(callback) {
+  let attempts = 0;
+
+  while (attempts <= MAX_BACKOFF_ATTEMPTS) {
+    try {
+      return callback();
+    } catch (e) {
+      console.error(e);
+
+      const delayTime = Math.min(
+        MAX_BACKOFF_TIME_MS,
+        2 ** attempts + Math.random() * 1000,
+      );
+
+      Utilities.sleep(delayTime);
+    }
+
+    attempts++;
+  }
 }
 
 /**
@@ -419,4 +644,16 @@ function _deleteState() {
 
 function _checkTimeout() {
   return Date.now() >= jobTimeoutTime;
+}
+
+/**
+ * Call the callback if the current log level meets the given log level.
+ *
+ * @param {number} logLevel - Log level condition
+ * @param {() => void} callback - Function to call if the log level is met
+ */
+function logWhen(logLevel, callback) {
+  if (DEBUG_LEVEL <= logLevel) {
+    callback();
+  }
 }
